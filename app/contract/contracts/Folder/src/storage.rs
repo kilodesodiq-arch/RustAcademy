@@ -39,8 +39,6 @@
 //! - **Value layout**: Changing `EscrowEntry` fields may require migration logic; adding optional
 //!   fields can be done carefully with defaults.
 
-
-
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Vec};
 
 use crate::types::{DisputeVote, EscrowEntry, FeeConfig, Role, StealthEscrowEntry};
@@ -105,6 +103,13 @@ pub const CURRENT_CONTRACT_VERSION: u32 = 1;
 pub const LEDGER_THRESHOLD: u32 = 17280; // ~1 day
 pub const SIX_MONTHS_IN_LEDGERS: u32 = 3110400; // ~185 days
 
+/// Maximum number of privacy-level changes retained per account.
+///
+/// `add_privacy_history` evicts the oldest entries beyond this cap so the
+/// per-account history index cannot grow without bound and bloat storage
+/// (Issue #51). Eviction is O(1) amortised and never scans global state.
+pub const MAX_PRIVACY_HISTORY: u32 = 50;
+
 /// Bitmask flags for granular operation pausing.
 #[contracttype]
 #[repr(u64)]
@@ -138,6 +143,8 @@ pub enum DataKey {
     ContractVersion,
     /// Admin address (singleton).
     Admin,
+    /// Pending admin transfer target (singleton).
+    PendingAdminTransfer,
     /// Explicit one-time initialization flag (singleton).
     Initialized,
     /// Paused state (singleton).
@@ -150,6 +157,8 @@ pub enum DataKey {
     UpgradeWindowEnd,
     /// Flag indicating an upgrade is in progress (between start_upgrade and complete_upgrade).
     UpgradeInProgress,
+    /// Snapshot of the pre-upgrade WASM hash used for recovery/cancel flows.
+    PendingUpgradeRollbackWasmHash,
     /// Pending WASM hash stored during start_upgrade.
     PendingUpgradeWasmHash,
     /// Pending contract version stored during start_upgrade.
@@ -194,6 +203,11 @@ pub enum DataKey {
     FeeCollector(u32),
     /// Tracks arbiter votes for disputed escrows. Keyed by (commitment, arbiter).
     DisputeVote(Bytes, Address),
+    /// Reverse index: commitment (`Bytes`) → deterministic `escrow_id`
+    /// (`BytesN<32>`). Recorded alongside [`EscrowIdMap`](DataKey::EscrowIdMap)
+    /// at creation so terminal-escrow cleanup can remove the dedup mapping
+    /// without the original creation salt (Issue #51).
+    CommitmentEscrowId(Bytes),
 }
 
 // -----------------------------------------------------------------------------
@@ -282,11 +296,32 @@ pub fn set_pending_upgrade_wasm_hash(env: &Env, hash: &BytesN<32>) {
         .set(&DataKey::PendingUpgradeWasmHash, hash);
 }
 
+/// Set the pre-upgrade WASM hash used for rollback/recovery.
+pub fn set_pending_upgrade_rollback_wasm_hash(env: &Env, hash: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::PendingUpgradeRollbackWasmHash, hash);
+}
+
 /// Get pending upgrade WASM hash.
 pub fn get_pending_upgrade_wasm_hash(env: &Env) -> Option<BytesN<32>> {
     env.storage()
         .persistent()
         .get(&DataKey::PendingUpgradeWasmHash)
+}
+
+/// Get the pre-upgrade WASM hash used for rollback/recovery.
+pub fn get_pending_upgrade_rollback_wasm_hash(env: &Env) -> Option<BytesN<32>> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PendingUpgradeRollbackWasmHash)
+}
+
+/// Clear the pre-upgrade WASM hash used for rollback/recovery.
+pub fn clear_pending_upgrade_rollback_wasm_hash(env: &Env) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingUpgradeRollbackWasmHash);
 }
 
 /// Set pending upgrade version.
@@ -308,6 +343,9 @@ pub fn clear_pending_upgrade(env: &Env) {
     env.storage()
         .persistent()
         .remove(&DataKey::UpgradeInProgress);
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingUpgradeRollbackWasmHash);
     env.storage()
         .persistent()
         .remove(&DataKey::PendingUpgradeWasmHash);
@@ -489,6 +527,25 @@ pub fn get_admin(env: &Env) -> Option<Address> {
     env.storage().persistent().get(&key)
 }
 
+/// Set the pending admin transfer target.
+pub fn set_pending_admin_transfer(env: &Env, pending_admin: &Address) {
+    let key = DataKey::PendingAdminTransfer;
+    env.storage().persistent().set(&key, pending_admin);
+}
+
+/// Get the pending admin transfer target.
+pub fn get_pending_admin_transfer(env: &Env) -> Option<Address> {
+    let key = DataKey::PendingAdminTransfer;
+    env.storage().persistent().get(&key)
+}
+
+/// Clear any pending admin transfer target.
+pub fn clear_pending_admin_transfer(env: &Env) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingAdminTransfer);
+}
+
 // -----------------------------------------------------------------------------
 // TTL Helper
 // -----------------------------------------------------------------------------
@@ -558,6 +615,11 @@ pub fn add_privacy_history(env: &Env, account: &Address, level: u32) {
         .get(&key)
         .unwrap_or(Vec::new(env));
     history.push_front(level);
+    // Bounded retention: evict the oldest entries beyond the cap so this
+    // per-account index cannot accumulate unbounded storage (Issue #51).
+    while history.len() > MAX_PRIVACY_HISTORY {
+        history.pop_back();
+    }
     env.storage().persistent().set(&key, &history);
 }
 
@@ -657,6 +719,13 @@ pub fn put_stealth_escrow(env: &Env, stealth_address: &BytesN<32>, entry: &Steal
     let key = DataKey::StealthEscrow(stealth_address.clone());
     env.storage().persistent().set(&key, entry);
     set_or_extend_ttl(env, &key, RecordType::StealthEscrow);
+}
+
+/// Remove a stealth escrow entry to reclaim its storage deposit (Issue #51).
+pub fn remove_stealth_escrow(env: &Env, stealth_address: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::StealthEscrow(stealth_address.clone()));
 }
 
 // -----------------------------------------------------------------------------
@@ -782,6 +851,12 @@ pub fn get_dispute_vote(env: &Env, commitment: &Bytes, arbiter: &Address) -> Opt
 pub fn has_dispute_vote(env: &Env, commitment: &Bytes, arbiter: &Address) -> bool {
     let key = DataKey::DisputeVote(commitment.clone(), arbiter.clone());
     env.storage().persistent().has(&key)
+}
+
+/// Remove a single arbiter's stored dispute vote (Issue #51 cleanup).
+pub fn remove_dispute_vote(env: &Env, commitment: &Bytes, arbiter: &Address) {
+    let key = DataKey::DisputeVote(commitment.clone(), arbiter.clone());
+    env.storage().persistent().remove(&key);
 }
 
 /// Count the number of votes for a disputed escrow.
