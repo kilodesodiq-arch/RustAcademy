@@ -581,6 +581,7 @@ export class SorobanEventParser {
     topics: xdr.ScVal[],
     data: xdr.ScVal,
     base: Omit<DisputeExpiryActionSetEvent, "eventType" | "action">,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     _indexedOffset: number,
   ): DisputeExpiryActionSetEvent {
     const map = this.dataToMap(data);
@@ -596,6 +597,7 @@ export class SorobanEventParser {
     topics: xdr.ScVal[],
     data: xdr.ScVal,
     base: Omit<DisputeTimeoutConfigSetEvent, "eventType" | "timeoutSecs">,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     _indexedOffset: number,
   ): DisputeTimeoutConfigSetEvent {
     const map = this.dataToMap(data);
@@ -639,6 +641,7 @@ export class SorobanEventParser {
     topics: xdr.ScVal[],
     data: xdr.ScVal,
     base: Omit<FeeConfigChangedEvent, "eventType" | "feeBps">,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     _indexedOffset: number,
   ): FeeConfigChangedEvent {
     const map = this.dataToMap(data);
