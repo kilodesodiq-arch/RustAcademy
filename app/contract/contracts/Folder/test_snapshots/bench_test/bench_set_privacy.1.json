@@ -409,6 +409,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "ledger_sequence"
+                  },
+                  "val": {
+                    "u32": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "schema_version"
                   },
                   "val": {
