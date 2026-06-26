@@ -14,7 +14,7 @@ use crate::{
         SupportedVersions, UpgradeState,
     },
 };
-use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{BytesN, Env, Symbol, Vec};
 
 include!(concat!(env!("OUT_DIR"), "/build_manifest.rs"));
 
@@ -183,16 +183,18 @@ pub fn event_replay_fields(env: &Env) -> Vec<Symbol> {
 /// - `source_hash`: Deterministic hash of all Rust source files (BLAKE3)
 /// - `schema_version`: Build manifest format version
 pub fn build_manifest() -> BuildManifest {
+    let git_bytes = hex::decode(GIT_HASH.trim())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or([0u8; 32]);
+    let source_bytes = hex::decode(SOURCE_HASH.trim())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or([0u8; 32]);
     BuildManifest {
-        git_hash: BytesN::from_array(
-            &Env::default(),
-            &hex::decode(GIT_HASH.trim()).unwrap_or_else(|_| [0u8; 32]),
-        ),
+        git_hash: BytesN::from_array(&Env::default(), &git_bytes),
         build_timestamp: BUILD_TIMESTAMP,
-        source_hash: BytesN::from_array(
-            &Env::default(),
-            &hex::decode(SOURCE_HASH.trim()).unwrap_or_else(|_| [0u8; 32]),
-        ),
+        source_hash: BytesN::from_array(&Env::default(), &source_bytes),
         schema_version: 1,
     }
 }

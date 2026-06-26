@@ -14,7 +14,7 @@ fn main() {
     let schema_version = "1";
 
     let manifest_content = format!(
-        r#"
+        r##"
 /// Build-time manifest embedded in the WASM artifact.
 ///
 /// This metadata is generated at compile time and provides deterministic
@@ -32,7 +32,7 @@ pub const SOURCE_HASH: &str = "{}";
 
 /// Schema version for the build manifest format.
 pub const BUILD_MANIFEST_SCHEMA_VERSION: u32 = {};
-"#,
+"##,
         serde_json::json!({
             "git_hash": git_hash,
             "build_timestamp": build_timestamp,
@@ -57,10 +57,7 @@ fn get_git_hash() -> String {
         .args(&["rev-parse", "HEAD"])
         .output()
         .unwrap_or_else(|_| {
-            Command::new("git")
-                .args(&["rev-parse", "--short", "HEAD"])
-                .output()
-                .unwrap_or_else(|_| panic!("Failed to get git hash"));
+            panic!("Failed to get git hash");
         });
 
     if output.status.success() {
