@@ -5,6 +5,8 @@ export enum CourseLevel {
   WEB3 = 'web3',
 }
 
+
+
 export enum schedule {
   EARLY = "early",
   MID = "mid",
