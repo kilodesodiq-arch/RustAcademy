@@ -10,7 +10,8 @@ const aiProviderFactory = {
   useFactory: (configService: ConfigService) => {
     const provider = configService.get<string>('AI_PROVIDER');
     if (provider === 'openai') return new OpenaiProvider(configService);
-    return new ClaudeProvider(configService);
+    if (provider === 'claude') return new ClaudeProvider(configService);
+    return null;
   },
   inject: [ConfigService],
 };

@@ -13,7 +13,7 @@ import * as Joi from 'joi';
         REDIS_HOST: Joi.string().default('localhost'),
         REDIS_PORT: Joi.number().default(6379),
         JWT_SECRET: Joi.string().optional(),
-        AI_PROVIDER: Joi.string().valid('claude', 'openai').default('claude'),
+        AI_PROVIDER: Joi.string().valid('claude', 'openai', 'mock').default('mock'),
         ANTHROPIC_API_KEY: Joi.string().optional(),
         OPENAI_API_KEY: Joi.string().optional(),
         AI_MODEL: Joi.string().optional(),
