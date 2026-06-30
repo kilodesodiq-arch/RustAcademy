@@ -97,6 +97,18 @@ const ERROR_MAPPINGS: Array<{
     message: 'The escrow has expired and can no longer be withdrawn.',
   },
 
+  // ── Refund specific ───────────────────────────────────────────────────────
+  {
+    pattern: /refund.*failed|refund.*error/i,
+    code: SorobanErrorCode.REFUND_FAILED,
+    message: 'The refund operation failed. Please check the refund eligibility and try again.',
+  },
+  {
+    pattern: /refund.*duplicate|already.*refunded|refund.*exists/i,
+    code: SorobanErrorCode.REFUND_DUPLICATE,
+    message: 'This refund has already been processed on-chain.',
+  },
+
   // ── Storage ───────────────────────────────────────────────────────────────
   {
     pattern: /restore.*required|entry.*expired.*restore/i,
@@ -138,6 +150,21 @@ const ERROR_MAPPINGS: Array<{
     pattern: /invalid.*wasm|wasm.*invalid/i,
     code: SorobanErrorCode.INVALID_WASM_HASH,
     message: 'The WASM hash provided for the contract upgrade is invalid.',
+  },
+  {
+    pattern: /upgrade.*window.*not.*active|upgrade.*window.*inactive/i,
+    code: SorobanErrorCode.UPGRADE_WINDOW_NOT_ACTIVE,
+    message: 'The upgrade window is not currently active. Please try again during the scheduled window.',
+  },
+  {
+    pattern: /upgrade.*already.*in.*progress/i,
+    code: SorobanErrorCode.UPGRADE_ALREADY_IN_PROGRESS,
+    message: 'An upgrade is already in progress. Please wait for it to complete before starting a new one.',
+  },
+  {
+    pattern: /upgrade.*not.*in.*progress|no.*upgrade.*in.*progress/i,
+    code: SorobanErrorCode.UPGRADE_NOT_IN_PROGRESS,
+    message: 'No upgrade is currently in progress. Start an upgrade first before performing this operation.',
   },
 
   // ── Input / params ────────────────────────────────────────────────────────

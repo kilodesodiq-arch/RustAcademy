@@ -7,6 +7,7 @@ mod bench_test;
 mod commitment;
 #[cfg(test)]
 mod commitment_test;
+mod dispute;
 mod errors;
 mod escrow;
 mod escrow_id;
@@ -22,6 +23,7 @@ mod fee_test;
 #[cfg(test)]
 mod fuzz_test;
 mod hook;
+mod metadata;
 #[cfg(test)]
 mod metadata_test;
 pub mod nonce;
@@ -48,8 +50,10 @@ mod upgrade_test;
 use errors::RustAcademyError;
 use storage::*;
 use types::{
-    DeploymentMetadata, EscrowEntry, EscrowStatus, FeeConfig, OracleFeeConfig,
-    PerAssetFeeConfig, PrivacyAwareEscrowView, Role, StealthDepositParams,
+    ContractHealth, DeploymentMetadata, DisputeExpiryAction, EscrowEntry,
+    EscrowOperationEstimate, EscrowOperationLimits, EscrowStatus, FeatureFlags, FeeConfig,
+    OracleFeeConfig, PerAssetFeeConfig, PrivacyAwareEscrowView, Role, SchemaCompatibility,
+    StealthDepositParams, SupportedVersions, UpgradeState,
 };
 
 pub use types::FeeRatio;
@@ -70,6 +74,21 @@ pub use types::FeeRatio;
 /// The contract uses Soroban's standardized token interface which works uniformly across
 /// all asset types. No special wrap/unwrap logic is required from users.
 ///
+/// ## Supported Escrow Limits
+///
+/// The contract publishes bounded escrow limits through
+/// [`RustAcademyContract::get_escrow_operation_limits`]. The current supported
+/// envelopes are:
+/// - deposit token transfers: 1
+/// - deposit arbiters: up to 10
+/// - deposit fee recipients: 0
+/// - withdraw token transfers: 1
+/// - withdraw fee recipients: up to 3
+/// - deposit/withdraw salt bytes: up to 512 for predictable execution
+///
+/// Requests outside those bounds fail with explicit contract errors instead of
+/// consuming unbounded Soroban resources.
+///
 /// ## Escrow State Machine
 ///
 /// ```text
@@ -80,6 +99,31 @@ pub use types::FeeRatio;
 /// Disputed --> Spent   : resolve_dispute() [arbiter decides for recipient]
 /// Disputed --> Refunded: resolve_dispute() [arbiter decides for owner]
 /// ```
+///
+/// ## Access Model (Issue #53)
+///
+/// Every public entry point falls into one access class, and every
+/// state-mutating method is gated accordingly. Unauthorized calls fail with a
+/// stable error code rather than silently succeeding.
+///
+/// | Class      | Gate                                             | Methods (examples) |
+/// |------------|--------------------------------------------------|--------------------|
+/// | **Admin**  | `require_admin` (+ `require_initialized`)         | `set_paused`, `pause_features`, `set_fee_config`, `set_admin`, `migrate`, `upgrade`, `start/complete/cancel_upgrade`, `grant/revoke_role`, `rotate_fee_collector` |
+/// | **Owner**  | caller `require_auth()`                            | `deposit*`, `withdraw`, `refund`, `set_privacy`, `enable_privacy`, `stealth_withdraw` |
+/// | **Arbiter**| arbiter `require_auth()` + membership check       | `resolve_dispute`, `vote_for_dispute`, `resolve_dispute_multi_sig` |
+/// | **Public** | none (read-only / pure)                           | `get_*`, `privacy_status`, `privacy_history`, `verify_amount_commitment`, `health_check` |
+///
+/// ### Mode gating
+///
+/// - **Global pause** (`is_paused`) and **per-feature pause** ([`PauseFlag`])
+///   block the corresponding state-mutating operations with
+///   [`OperationPaused`](errors::RustAcademyError::OperationPaused) /
+///   [`ContractPaused`](errors::RustAcademyError::ContractPaused).
+/// - **Emergency mode** blocks deposits and freezes admin/pause configuration
+///   changes once activated (it is irreversible).
+/// - **Upgrade in progress** restricts the upgrade lifecycle methods.
+///
+/// Read-only getters remain callable in every mode by design.
 #[contract]
 pub struct RustAcademyContract;
 
@@ -115,13 +159,7 @@ impl RustAcademyContract {
         to: Address,
         salt: Bytes,
     ) -> Result<bool, RustAcademyError> {
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        if is_feature_paused(&env, PauseFlag::Withdrawal) {
-            return Err(RustAcademyError::OperationPaused);
-        }
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_withdraw(&env, PauseFlag::Withdrawal)?;
         escrow::withdraw(&env, amount, to, salt)
     }
 
@@ -130,14 +168,31 @@ impl RustAcademyContract {
     /// Records the level in storage and appends it to the account's privacy history.
     /// For boolean on/off privacy, prefer [`set_privacy`]( RustAcademyContract::set_privacy).
     ///
+    /// Access: **owner** — `account` must authorize the call. Gated by the
+    /// [`PauseFlag::SetPrivacy`] feature flag.
+    ///
     /// # Arguments
     /// * `env` - The contract environment
-    /// * `account` - The account to configure
+    /// * `account` - The account to configure (must authorize)
     /// * `privacy_level` - Numeric level (0 = off, higher = more privacy; interpretation is application-specific)
-    pub fn enable_privacy(env: Env, account: Address, privacy_level: u32) -> bool {
+    ///
+    /// # Errors
+    /// * `OperationPaused` - The `SetPrivacy` feature is paused.
+    pub fn enable_privacy(
+        env: Env,
+        account: Address,
+        privacy_level: u32,
+    ) -> Result<bool, RustAcademyError> {
+        // Owner-gated: only the account itself may change its privacy level.
+        // Previously this method had no authorization, letting any caller write
+        // another account's privacy level and history (Issue #53).
+        account.require_auth();
+        if is_feature_paused(&env, PauseFlag::SetPrivacy) {
+            return Err(RustAcademyError::OperationPaused);
+        }
         set_privacy_level(&env, &account, privacy_level);
         add_privacy_history(&env, &account, privacy_level);
-        true
+        Ok(true)
     }
 
     /// Get the current numeric privacy level for an account.
@@ -173,7 +228,10 @@ impl RustAcademyContract {
     /// * `ContractPaused` - Contract is currently paused
     /// * `PrivacyAlreadySet` - Privacy state is already at the requested value
     pub fn set_privacy(env: Env, owner: Address, enabled: bool) -> Result<(), RustAcademyError> {
-        admin::require_initialized(&env)?;
+        admin::guard_initialized(&env)?;
+        if is_feature_paused(&env, PauseFlag::SetPrivacy) {
+            return Err(RustAcademyError::OperationPaused);
+        }
         privacy::set_privacy(&env, owner, enabled)
     }
 
@@ -216,16 +274,7 @@ impl RustAcademyContract {
         timeout_secs: u64,
         arbiter: Option<Address>,
     ) -> Result<BytesN<32>, RustAcademyError> {
-        if storage::is_emergency_mode(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        if is_feature_paused(&env, PauseFlag::Deposit) {
-            return Err(RustAcademyError::OperationPaused);
-        }
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_deposit(&env, PauseFlag::Deposit)?;
         escrow::deposit(&env, token, amount, owner, salt, timeout_secs, arbiter)
     }
 
@@ -279,6 +328,9 @@ impl RustAcademyContract {
         amount: i128,
         salt: Bytes,
     ) -> Result<BytesN<32>, RustAcademyError> {
+        if is_feature_paused(&env, PauseFlag::CreateAmountCommitment) {
+            return Err(RustAcademyError::OperationPaused);
+        }
         commitment::create_amount_commitment(&env, owner, amount, salt)
     }
 
@@ -351,16 +403,7 @@ impl RustAcademyContract {
         timeout_secs: u64,
         arbiter: Option<Address>,
     ) -> Result<(), RustAcademyError> {
-        if storage::is_emergency_mode(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        if is_feature_paused(&env, PauseFlag::DepositWithCommitment) {
-            return Err(RustAcademyError::OperationPaused);
-        }
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_deposit(&env, PauseFlag::DepositWithCommitment)?;
         escrow::deposit_with_commitment(
             &env,
             from,
@@ -373,11 +416,7 @@ impl RustAcademyContract {
     }
     /// Activate emergency mode (irreversible). Only admin can call. Emits event.
     pub fn activate_emergency_mode(env: Env, caller: Address) -> Result<(), RustAcademyError> {
-        // Only admin can activate
-        let admin = get_admin(&env).ok_or(RustAcademyError::Unauthorized)?;
-        if caller != admin {
-            return Err(RustAcademyError::Unauthorized);
-        }
+        admin::require_admin(&env, &caller)?;
         if storage::is_emergency_mode(&env) {
             return Ok(()); // Already set
         }
@@ -417,13 +456,7 @@ impl RustAcademyContract {
         timeout_secs: u64,
         arbiter: Option<Address>,
     ) -> Result<BytesN<32>, RustAcademyError> {
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        if is_feature_paused(&env, PauseFlag::Deposit) {
-            return Err(RustAcademyError::OperationPaused);
-        }
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_deposit(&env, PauseFlag::Deposit)?;
         escrow::deposit_partial(
             &env,
             token,
@@ -434,6 +467,42 @@ impl RustAcademyContract {
             timeout_secs,
             arbiter,
         )
+    }
+
+    /// Create a multi-signature (M-of-N) arbitration escrow.
+    ///
+    /// Like `deposit`, but accepts a list of arbiters and a threshold: `threshold`
+    /// of the `arbiters` must vote to resolve any dispute.
+    ///
+    /// # Arguments
+    /// * `token` - Token contract address
+    /// * `amount` - Amount to escrow (must be > 0)
+    /// * `owner` - Depositor address (must authorize)
+    /// * `salt` - Uniqueness salt (max 1024 bytes)
+    /// * `timeout_secs` - Seconds until expiry; 0 = no expiry
+    /// * `arbiters` - Non-empty list of arbiter addresses (max 10, no duplicates)
+    /// * `threshold` - Number of arbiter votes required to resolve (1 ≤ threshold ≤ len(arbiters))
+    ///
+    /// # Errors
+    /// * `InvalidAmount` - Amount is zero or negative
+    /// * `InvalidSalt` - Salt exceeds 1024 bytes
+    /// * `InvalidThreshold` - Threshold is 0, exceeds arbiter count, or arbiters is empty
+    /// * `DuplicateArbiter` - The arbiters list contains duplicate addresses
+    /// * `TooManyArbiters` - More than 10 arbiters provided
+    /// * `CommitmentAlreadyExists` - An escrow with the same commitment already exists
+    #[allow(clippy::too_many_arguments)]
+    pub fn deposit_with_arbiters(
+        env: Env,
+        token: Address,
+        amount: i128,
+        owner: Address,
+        salt: Bytes,
+        timeout_secs: u64,
+        arbiters: Vec<Address>,
+        threshold: u32,
+    ) -> Result<BytesN<32>, RustAcademyError> {
+        admin::guard_deposit(&env, PauseFlag::Deposit)?;
+        escrow::deposit_with_arbiters(&env, token, amount, owner, salt, timeout_secs, arbiters, threshold)
     }
 
     /// Make a partial payment towards an existing escrow.
@@ -460,13 +529,7 @@ impl RustAcademyContract {
         payer: Address,
         payment_amount: i128,
     ) -> Result<(), RustAcademyError> {
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        if is_feature_paused(&env, PauseFlag::Deposit) {
-            return Err(RustAcademyError::OperationPaused);
-        }
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_deposit(&env, PauseFlag::Deposit)?;
         escrow::partial_payment(&env, commitment, payer, payment_amount)
     }
 
@@ -490,14 +553,7 @@ impl RustAcademyContract {
         commitment: BytesN<32>,
         caller: Address,
     ) -> Result<(), RustAcademyError> {
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        if is_feature_paused(&env, PauseFlag::Refund) {
-            return Err(RustAcademyError::OperationPaused);
-        }
-
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_refund(&env, PauseFlag::Refund)?;
         escrow::refund(&env, commitment, caller)
     }
 
@@ -505,15 +561,26 @@ impl RustAcademyContract {
     ///
     /// Only escrows in `Spent` or `Refunded` status can be removed.
     pub fn cleanup_escrow(env: Env, commitment: BytesN<32>) -> Result<(), RustAcademyError> {
-        admin::require_initialized(&env)?;
+        admin::guard_initialized(&env)?;
         escrow::cleanup_escrow(&env, commitment)
+    }
+
+    /// Cleanup a terminal stealth escrow entry to reclaim storage.
+    ///
+    /// Only stealth escrows in `Spent` or `Refunded` status can be removed.
+    pub fn cleanup_stealth_escrow(
+        env: Env,
+        stealth_address: BytesN<32>,
+    ) -> Result<(), RustAcademyError> {
+        admin::require_initialized(&env)?;
+        stealth::cleanup_stealth_escrow(&env, stealth_address)
     }
 
     /// Extend the storage TTL of an escrow record.
     ///
     /// Any user can call this to keep an escrow from being archived.
     pub fn extend_escrow_ttl(env: Env, commitment: BytesN<32>) -> Result<(), RustAcademyError> {
-        admin::require_initialized(&env)?;
+        admin::guard_initialized(&env)?;
         escrow::extend_escrow_ttl(&env, commitment)
     }
 
@@ -531,10 +598,7 @@ impl RustAcademyContract {
     /// * `NoArbiter` - No arbiter assigned to the escrow
     /// * `InvalidDisputeState` - Escrow is not in `Pending` status
     pub fn dispute(env: Env, commitment: BytesN<32>) -> Result<(), RustAcademyError> {
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_dispute(&env)?;
         escrow::dispute(&env, commitment)
     }
 
@@ -561,10 +625,7 @@ impl RustAcademyContract {
         resolve_for_owner: bool,
         recipient: Address,
     ) -> Result<(), RustAcademyError> {
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_dispute(&env)?;
         escrow::resolve_dispute(&env, caller, commitment, resolve_for_owner, recipient)
     }
 
@@ -590,10 +651,7 @@ impl RustAcademyContract {
         commitment: BytesN<32>,
         resolve_for_owner: bool,
     ) -> Result<(), RustAcademyError> {
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_dispute(&env)?;
         escrow::vote_for_dispute(&env, caller, commitment, resolve_for_owner)
     }
 
@@ -616,11 +674,67 @@ impl RustAcademyContract {
         commitment: BytesN<32>,
         recipient: Address,
     ) -> Result<(), RustAcademyError> {
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_dispute(&env)?;
         escrow::resolve_dispute_multi_sig(&env, commitment, recipient)
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispute timeout / auto-resolution (Issue #49)
+    // -----------------------------------------------------------------------
+
+    /// Set the global dispute resolution timeout in seconds.
+    ///
+    /// Requires Admin or Operator role. Emits `DisputeTimeoutConfigSet`.
+    pub fn set_dispute_timeout(
+        env: Env,
+        caller: Address,
+        timeout_secs: u64,
+    ) -> Result<(), RustAcademyError> {
+        hook::assert_not_reentrant(&env)?;
+        dispute::set_timeout(&env, caller, timeout_secs)
+    }
+
+    /// Get the current global dispute resolution timeout in seconds.
+    pub fn get_dispute_timeout(env: Env) -> u64 {
+        storage::get_dispute_timeout(&env)
+    }
+
+    /// Set the global default action for expired disputes.
+    ///
+    /// Requires Admin or Operator role. Emits `DisputeExpiryActionSet`.
+    pub fn set_dispute_expiry_action(
+        env: Env,
+        caller: Address,
+        action: DisputeExpiryAction,
+    ) -> Result<(), RustAcademyError> {
+        hook::assert_not_reentrant(&env)?;
+        dispute::set_expiry_action(&env, caller, action)
+    }
+
+    /// Get the current global default action for expired disputes.
+    pub fn get_dispute_expiry_action(env: Env) -> DisputeExpiryAction {
+        storage::get_dispute_expiry_action(&env)
+    }
+
+    /// Get the dispute expiry metadata for an escrow, if any.
+    pub fn get_dispute_expiry(
+        env: Env,
+        commitment: BytesN<32>,
+    ) -> Option<crate::types::DisputeExpiry> {
+        let commitment_bytes: Bytes = commitment.into();
+        storage::get_dispute_expiry(&env, &commitment_bytes)
+    }
+
+    /// Resolve a disputed escrow that has passed its resolution timeout.
+    ///
+    /// Can be called by anyone once the timeout has elapsed. The outcome is
+    /// deterministic and based on the snapshotted expiry action.
+    pub fn resolve_expired_dispute(
+        env: Env,
+        commitment: BytesN<32>,
+    ) -> Result<(), RustAcademyError> {
+        hook::assert_not_reentrant(&env)?;
+        dispute::resolve_expired_dispute(&env, commitment)
     }
 
     /// Initialize the contract with an admin address (one-time only).
@@ -657,12 +771,82 @@ impl RustAcademyContract {
     /// - `contract_id` — on-chain address of this contract instance, which binds
     ///   the metadata to a specific deployment and network.
     pub fn get_deployment_metadata(env: Env) -> DeploymentMetadata {
-        DeploymentMetadata {
-            contract_version: admin::get_version(&env),
-            event_schema_version: events::EVENT_SCHEMA_VERSION,
-            wasm_hash: storage::get_wasm_hash(&env),
-            contract_id: env.current_contract_address(),
-        }
+        metadata::deployment_metadata(&env)
+    }
+
+    /// Return a non-mutating health summary of the contract.
+    ///
+    /// The status is derived from pause, emergency, and upgrade flags.  It is
+    /// ordered from most to least severe: emergency > upgrading > paused > healthy.
+    pub fn get_contract_health(env: Env) -> ContractHealth {
+        metadata::contract_health(&env)
+    }
+
+    /// Return the feature flags supported by this contract build.
+    ///
+    /// Tooling can use these flags to detect whether optional flows (e.g. upgrade
+    /// gating, stealth escrows) are available before sending writes.
+    pub fn get_feature_flags(_env: Env) -> FeatureFlags {
+        metadata::feature_flags()
+    }
+
+    /// Return the state of the upgrade gating mechanism.
+    pub fn get_upgrade_state(env: Env) -> UpgradeState {
+        metadata::upgrade_state(&env)
+    }
+
+    /// Return the supported version ranges for this contract build.
+    pub fn get_supported_versions(env: Env) -> SupportedVersions {
+        metadata::supported_versions(&env)
+    }
+
+    /// Check whether a caller-supplied version pair is compatible with this deployment.
+    ///
+    /// The contract version is compatible when it equals the current stored version
+    /// (migrations are required to move between contract versions).  The event
+    /// schema version is compatible when it is one of the versions emitted by this
+    /// build.
+    pub fn check_schema_compatibility(
+        env: Env,
+        requested_contract_version: u32,
+        requested_event_schema_version: u32,
+    ) -> SchemaCompatibility {
+        metadata::check_schema_compatibility(
+            &env,
+            requested_contract_version,
+            requested_event_schema_version,
+        )
+    }
+
+    /// Return the current granular pause bitmask.
+    ///
+    /// See [`crate::storage::PauseFlag`] for the bit definitions.  A value of `0`
+    /// means no features are paused.
+    pub fn get_pause_flags(env: Env) -> u64 {
+        metadata::pause_flags(&env)
+    }
+
+    /// Return the supported escrow operation limits and published budget envelopes.
+    pub fn get_escrow_operation_limits(_env: Env) -> EscrowOperationLimits {
+        escrow::operation_limits()
+    }
+
+    /// Estimate the bounded resource envelope for a deposit-shaped payload.
+    pub fn estimate_deposit_resources(
+        _env: Env,
+        salt_bytes: u32,
+        arbiter_count: u32,
+    ) -> Result<EscrowOperationEstimate, RustAcademyError> {
+        escrow::estimate_deposit_resources_view(salt_bytes, arbiter_count)
+    }
+
+    /// Estimate the bounded resource envelope for a withdraw-shaped payload.
+    pub fn estimate_withdraw_resources(
+        env: Env,
+        token: Address,
+        salt_bytes: u32,
+    ) -> Result<EscrowOperationEstimate, RustAcademyError> {
+        escrow::estimate_withdraw_resources_view(&env, token, salt_bytes)
     }
 
     /// Run any pending data migrations for the current contract code (**Admin only**).
@@ -685,9 +869,7 @@ impl RustAcademyContract {
     /// # Errors
     /// * `Unauthorized` - Caller is not the admin, or admin not set
     pub fn set_paused(env: Env, caller: Address, new_state: bool) -> Result<(), RustAcademyError> {
-        if storage::is_emergency_mode(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
+        admin::guard_admin_config(&env)?;
         admin::set_paused(&env, caller, new_state)
     }
 
@@ -710,9 +892,7 @@ impl RustAcademyContract {
     /// # Errors
     /// * `Unauthorized` - Caller is not the admin, or admin not set
     pub fn pause_features(env: Env, caller: Address, mask: u64) -> Result<(), RustAcademyError> {
-        if storage::is_emergency_mode(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
+        admin::guard_admin_config(&env)?;
         admin::set_pause_flags(&env, &caller, mask, 0)
     }
 
@@ -727,9 +907,7 @@ impl RustAcademyContract {
     /// # Errors
     /// * `Unauthorized` - Caller is not the admin, or admin not set
     pub fn unpause_features(env: Env, caller: Address, mask: u64) -> Result<(), RustAcademyError> {
-        if storage::is_emergency_mode(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
+        admin::guard_admin_config(&env)?;
         admin::set_pause_flags(&env, &caller, 0, mask)
     }
 
@@ -749,9 +927,7 @@ impl RustAcademyContract {
         caller: Address,
         new_admin: Address,
     ) -> Result<(), RustAcademyError> {
-        if storage::is_emergency_mode(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
+        admin::guard_admin_config(&env)?;
         admin::set_admin(&env, caller, new_admin)
     }
 
@@ -795,15 +971,13 @@ impl RustAcademyContract {
 
     /// Register an external hook contract to receive escrow lifecycle callbacks.
     pub fn register_hook(env: Env, hook_contract: Address) -> Result<(), RustAcademyError> {
-        admin::require_initialized(&env)?;
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_initialized(&env)?;
         hook::register_hook(&env, hook_contract)
     }
 
     /// Unregister a hook contract.
     pub fn unregister_hook(env: Env, hook_contract: Address) -> Result<(), RustAcademyError> {
-        admin::require_initialized(&env)?;
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_initialized(&env)?;
         hook::unregister_hook(&env, hook_contract)
     }
 
@@ -818,7 +992,7 @@ impl RustAcademyContract {
         caller: Address,
         config: FeeConfig,
     ) -> Result<(), RustAcademyError> {
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_admin_config(&env)?;
         admin::set_fee_config(&env, &caller, config)
     }
 
@@ -829,7 +1003,7 @@ impl RustAcademyContract {
         token: Address,
         config: PerAssetFeeConfig,
     ) -> Result<(), RustAcademyError> {
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_admin_config(&env)?;
         admin::set_per_asset_fee(&env, &caller, token, config)
     }
 
@@ -844,7 +1018,7 @@ impl RustAcademyContract {
         caller: Address,
         config: OracleFeeConfig,
     ) -> Result<(), RustAcademyError> {
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_admin_config(&env)?;
         admin::set_oracle_fee_config(&env, &caller, config)
     }
 
@@ -864,7 +1038,7 @@ impl RustAcademyContract {
         caller: Address,
         wallet: Address,
     ) -> Result<(), RustAcademyError> {
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_admin_config(&env)?;
         admin::set_platform_wallet(&env, &caller, wallet)
     }
 
@@ -874,7 +1048,7 @@ impl RustAcademyContract {
         caller: Address,
         new_collector: Address,
     ) -> Result<u32, RustAcademyError> {
-        hook::assert_not_reentrant(&env)?;
+        admin::guard_admin_config(&env)?;
         admin::rotate_fee_collector(&env, &caller, new_collector)
     }
 
@@ -1016,12 +1190,7 @@ impl RustAcademyContract {
         env: Env,
         params: StealthDepositParams,
     ) -> Result<BytesN<32>, RustAcademyError> {
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        if is_feature_paused(&env, PauseFlag::Deposit) {
-            return Err(RustAcademyError::OperationPaused);
-        }
+        admin::guard_stealth(&env, PauseFlag::Deposit)?;
         stealth::register_ephemeral_key(&env, params)
     }
 
@@ -1053,12 +1222,7 @@ impl RustAcademyContract {
         spend_pub: BytesN<32>,
         stealth_address: BytesN<32>,
     ) -> Result<bool, RustAcademyError> {
-        if admin::is_paused(&env) {
-            return Err(RustAcademyError::ContractPaused);
-        }
-        if is_feature_paused(&env, PauseFlag::Withdrawal) {
-            return Err(RustAcademyError::OperationPaused);
-        }
+        admin::guard_stealth(&env, PauseFlag::Withdrawal)?;
         stealth::stealth_withdraw(&env, recipient, eph_pub, spend_pub, stealth_address)
     }
 
@@ -1086,6 +1250,8 @@ impl RustAcademyContract {
     ///
     /// # Errors
     /// * `Unauthorized` - Caller is not the admin, or admin not set
+    /// * `UpgradeNotInProgress` - no upgrade is currently in progress
+    /// * `UpgradeWindowNotActive` - upgrade window is not currently active
     ///
     /// # Security
     /// Updates the contract's executable code. Call [`migrate`]( RustAcademyContract::migrate)
@@ -1142,8 +1308,8 @@ impl RustAcademyContract {
     /// * `new_wasm_hash` - The target WASM hash
     ///
     /// # Errors
-    /// * `InvalidAmount` - (repurposed) upgrade window not active
-    /// * `ContractPaused` - (repurposed) upgrade already in progress
+    /// * `UpgradeWindowNotActive` - upgrade window is not currently active
+    /// * `UpgradeAlreadyInProgress` - an upgrade is already in progress
     pub fn start_upgrade(
         env: Env,
         caller: Address,
@@ -1172,7 +1338,8 @@ impl RustAcademyContract {
     /// The actual new contract version
     ///
     /// # Errors
-    /// * `InternalError` - no upgrade in progress, or post-upgrade invariants violated
+    /// * `UpgradeNotInProgress` - no upgrade is currently in progress
+    /// * `InternalError` - post-upgrade invariants violated
     pub fn complete_upgrade(
         env: Env,
         caller: Address,

@@ -336,6 +336,7 @@ pub fn set_upgrade_window(
 ) -> Result<(), RustAcademyError> {
     require_admin(env, caller)?;
     storage::set_upgrade_window(env, start, end);
+    crate::events::publish_upgrade_window_set(env, caller.clone(), start, end);
     Ok(())
 }
 
@@ -353,11 +354,11 @@ pub fn start_upgrade(
 
     // Check upgrade window is active (Issue #432 AC1)
     if !storage::is_upgrade_window_active(env) {
-        return Err(RustAcademyError::InvalidAmount); // Repurpose for "upgrade window not active"
+        return Err(RustAcademyError::UpgradeWindowNotActive);
     }
 
     if storage::is_upgrade_in_progress(env) {
-        return Err(RustAcademyError::ContractPaused); // Reuse for "upgrade in progress"
+        return Err(RustAcademyError::UpgradeAlreadyInProgress);
     }
 
     let old_version = get_version(env);
@@ -397,11 +398,11 @@ pub fn upgrade(
     require_admin(env, caller)?;
 
     if !storage::is_upgrade_in_progress(env) {
-        return Err(RustAcademyError::InternalError);
+        return Err(RustAcademyError::UpgradeNotInProgress);
     }
 
     if !storage::is_upgrade_window_active(env) {
-        return Err(RustAcademyError::InvalidAmount);
+        return Err(RustAcademyError::UpgradeWindowNotActive);
     }
 
     let pending_hash =
@@ -447,7 +448,7 @@ pub fn complete_upgrade(
     new_version: u32,
 ) -> Result<u32, RustAcademyError> {
     if !storage::is_upgrade_in_progress(env) {
-        return Err(RustAcademyError::InternalError); // Not in upgrade state
+        return Err(RustAcademyError::UpgradeNotInProgress);
     }
 
     // Verify version and hash (Issue #432 AC2)
@@ -493,6 +494,110 @@ pub fn require_not_paused(env: &Env) -> Result<(), RustAcademyError> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Shared Guard Helpers for Authorization Normalization
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Require that the contract is not in emergency mode.
+///
+/// Emergency mode is an irreversible state that blocks most mutating operations.
+/// Only admin can activate it via `activate_emergency_mode`.
+pub fn require_not_emergency_mode(env: &Env) -> Result<(), RustAcademyError> {
+    if storage::is_emergency_mode(env) {
+        return Err(RustAcademyError::ContractPaused);
+    }
+    Ok(())
+}
+
+/// Require that the contract is not paused (global pause).
+///
+/// This is the global pause flag that blocks operations when set.
+pub fn require_not_paused_global(env: &Env) -> Result<(), RustAcademyError> {
+    if is_paused(env) {
+        return Err(RustAcademyError::ContractPaused);
+    }
+    Ok(())
+}
+
+/// Require that a specific feature is not paused.
+///
+/// Checks the granular pause flags for specific operations.
+pub fn require_feature_not_paused(env: &Env, flag: crate::storage::PauseFlag) -> Result<(), RustAcademyError> {
+    if storage::is_feature_paused(env, flag) {
+        return Err(RustAcademyError::OperationPaused);
+    }
+    Ok(())
+}
+
+/// Standard guard for user-initiated deposit operations.
+///
+/// Checks: emergency mode, global pause, feature pause, reentrancy.
+pub fn guard_deposit(env: &Env, pause_flag: crate::storage::PauseFlag) -> Result<(), RustAcademyError> {
+    require_not_emergency_mode(env)?;
+    require_not_paused_global(env)?;
+    require_feature_not_paused(env, pause_flag)?;
+    crate::hook::assert_not_reentrant(env)?;
+    Ok(())
+}
+
+/// Standard guard for withdrawal operations.
+///
+/// Checks: global pause, feature pause, reentrancy.
+/// Note: Emergency mode does NOT block withdrawals (users need to access funds).
+pub fn guard_withdraw(env: &Env, pause_flag: crate::storage::PauseFlag) -> Result<(), RustAcademyError> {
+    require_not_paused_global(env)?;
+    require_feature_not_paused(env, pause_flag)?;
+    crate::hook::assert_not_reentrant(env)?;
+    Ok(())
+}
+
+/// Standard guard for refund operations.
+///
+/// Checks: global pause, feature pause, reentrancy.
+pub fn guard_refund(env: &Env, pause_flag: crate::storage::PauseFlag) -> Result<(), RustAcademyError> {
+    require_not_paused_global(env)?;
+    require_feature_not_paused(env, pause_flag)?;
+    crate::hook::assert_not_reentrant(env)?;
+    Ok(())
+}
+
+/// Standard guard for dispute operations.
+///
+/// Checks: global pause, reentrancy.
+pub fn guard_dispute(env: &Env) -> Result<(), RustAcademyError> {
+    require_not_paused_global(env)?;
+    crate::hook::assert_not_reentrant(env)?;
+    Ok(())
+}
+
+/// Standard guard for admin configuration operations.
+///
+/// Checks: emergency mode, reentrancy.
+pub fn guard_admin_config(env: &Env) -> Result<(), RustAcademyError> {
+    require_not_emergency_mode(env)?;
+    crate::hook::assert_not_reentrant(env)?;
+    Ok(())
+}
+
+/// Standard guard for operations that require initialization.
+///
+/// Checks: initialization, reentrancy.
+pub fn guard_initialized(env: &Env) -> Result<(), RustAcademyError> {
+    require_initialized(env)?;
+    crate::hook::assert_not_reentrant(env)?;
+    Ok(())
+}
+
+/// Standard guard for stealth address operations.
+///
+/// Checks: global pause, feature pause, reentrancy.
+pub fn guard_stealth(env: &Env, pause_flag: crate::storage::PauseFlag) -> Result<(), RustAcademyError> {
+    require_not_paused_global(env)?;
+    require_feature_not_paused(env, pause_flag)?;
+    crate::hook::assert_not_reentrant(env)?;
+    Ok(())
+}
+
 /// Set granular pause flags (**Admin or Operator only**).
 pub fn set_pause_flags(
     env: &Env,
@@ -503,6 +608,7 @@ pub fn set_pause_flags(
     require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
 
     storage::set_pause_flags(env, caller, flags_to_enable, flags_to_disable);
+    crate::events::publish_pause_flags_changed(env, caller.clone(), flags_to_enable, flags_to_disable);
     Ok(())
 }
 
