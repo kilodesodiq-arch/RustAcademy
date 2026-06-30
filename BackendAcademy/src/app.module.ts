@@ -18,6 +18,7 @@ import { LessonModule } from './lessons/lesson.module';
 import { TaskModule } from './tasks/task.module';
 import { AppConfigModule } from './config/config.module';
 import { ContractsModule } from './contracts/contracts.module';
+import { SearchModule } from './search/search.module';
 import { PaymentsModule } from './payments/payments.module';
 
 @Module({
@@ -43,6 +44,7 @@ import { PaymentsModule } from './payments/payments.module';
     OnboardingModule,
     LessonModule,
     TaskModule,
+    SearchModule,
     PaymentsModule,
   ],
   controllers: [AppController],
